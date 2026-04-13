@@ -1,0 +1,4 @@
+PyQt6
+matplotlib
+pandas
+akshare
