@@ -35,6 +35,9 @@ class StrategyOptimizer:
         end_date: date,
         buy_step: float = 0.005,
         sell_step: float = 0.005,
+        total_capital: float = 10000.0,
+        max_consecutive_buy: int = 5,
+        max_consecutive_sell: int = 5,
     ) -> None:
         """初始化优化器
 
@@ -44,12 +47,18 @@ class StrategyOptimizer:
             end_date: 清仓日期
             buy_step: 买入比例搜索步长，默认 0.005 (0.5%)
             sell_step: 卖出比例搜索步长，默认 0.005 (0.5%)
+            total_capital: 总资金（默认10000元）
+            max_consecutive_buy: 最多连续买入次数
+            max_consecutive_sell: 最多连续卖出次数
         """
         self.nav_data = nav_data
         self.start_date = start_date
         self.end_date = end_date
         self.buy_step = buy_step
         self.sell_step = sell_step
+        self.total_capital = total_capital
+        self.max_consecutive_buy = max_consecutive_buy
+        self.max_consecutive_sell = max_consecutive_sell
 
     def optimize(self) -> OptimizationResult:
         """执行网格搜索优化
@@ -86,6 +95,9 @@ class StrategyOptimizer:
                         end_date=self.end_date,
                         buy_threshold=buy_threshold,
                         sell_threshold=sell_threshold,
+                        total_capital=self.total_capital,
+                        max_consecutive_buy=self.max_consecutive_buy,
+                        max_consecutive_sell=self.max_consecutive_sell,
                     )
                     result = strategy.execute()
 
@@ -142,6 +154,9 @@ class StrategyOptimizer:
                         end_date=self.end_date,
                         buy_threshold=buy_threshold,
                         sell_threshold=sell_threshold,
+                        total_capital=self.total_capital,
+                        max_consecutive_buy=self.max_consecutive_buy,
+                        max_consecutive_sell=self.max_consecutive_sell,
                     )
                     result = strategy.execute()
 
@@ -195,7 +210,7 @@ def format_optimization_result(result: OptimizationResult) -> str:
 def format_strategy_result_compact(result: StrategyResult) -> str:
     """格式化策略结果为紧凑格式"""
     lines = [
-        f"  总投入: {result.total_investment:.2f} 元",
+        f"  总资金: {result.total_investment:.2f} 元",
         f"  最终金额: {result.final_value:.2f} 元",
         f"  收益率: {result.total_return_rate*100:+.2f}%",
         f"  买入次数: {result.buy_count} 次",

@@ -65,6 +65,9 @@ class StrategyWorker(QObject):
         end_date: date,
         buy_threshold: float,
         sell_threshold: float,
+        total_capital: float = 10000.0,
+        max_consecutive_buy: int = 5,
+        max_consecutive_sell: int = 5,
     ) -> None:
         super().__init__()
         self.nav_data = nav_data
@@ -72,6 +75,9 @@ class StrategyWorker(QObject):
         self.end_date = end_date
         self.buy_threshold = buy_threshold
         self.sell_threshold = sell_threshold
+        self.total_capital = total_capital
+        self.max_consecutive_buy = max_consecutive_buy
+        self.max_consecutive_sell = max_consecutive_sell
 
     def run(self) -> None:
         try:
@@ -81,6 +87,9 @@ class StrategyWorker(QObject):
                 end_date=self.end_date,
                 buy_threshold=self.buy_threshold,
                 sell_threshold=self.sell_threshold,
+                total_capital=self.total_capital,
+                max_consecutive_buy=self.max_consecutive_buy,
+                max_consecutive_sell=self.max_consecutive_sell,
             )
             result = strategy.execute()
             self.finished.emit(result)
@@ -101,12 +110,18 @@ class OptimizerWorker(QObject):
         start_date: date,
         end_date: date,
         quick_mode: bool = True,
+        total_capital: float = 10000.0,
+        max_consecutive_buy: int = 5,
+        max_consecutive_sell: int = 5,
     ) -> None:
         super().__init__()
         self.nav_data = nav_data
         self.start_date = start_date
         self.end_date = end_date
         self.quick_mode = quick_mode
+        self.total_capital = total_capital
+        self.max_consecutive_buy = max_consecutive_buy
+        self.max_consecutive_sell = max_consecutive_sell
 
     def run(self) -> None:
         try:
@@ -114,6 +129,9 @@ class OptimizerWorker(QObject):
                 nav_data=self.nav_data,
                 start_date=self.start_date,
                 end_date=self.end_date,
+                total_capital=self.total_capital,
+                max_consecutive_buy=self.max_consecutive_buy,
+                max_consecutive_sell=self.max_consecutive_sell,
             )
 
             if self.quick_mode:
@@ -233,6 +251,22 @@ class MainWindow(QMainWindow):
         param_layout = QVBoxLayout(param_group)
         param_layout.setSpacing(10)
 
+        # 总资金
+        total_capital_layout = QHBoxLayout()
+        total_capital_label = QLabel("总资金:")
+        total_capital_label.setFont(QFont("Microsoft YaHei", 9))
+        total_capital_layout.addWidget(total_capital_label)
+
+        self.total_capital_spin = QDoubleSpinBox()
+        self.total_capital_spin.setRange(1000.0, 1000000.0)
+        self.total_capital_spin.setValue(10000.0)  # 默认值1万
+        self.total_capital_spin.setSingleStep(1000.0)
+        self.total_capital_spin.setDecimals(0)
+        self.total_capital_spin.setSuffix(" 元")
+        self.total_capital_spin.setFont(QFont("Microsoft YaHei", 9))
+        total_capital_layout.addWidget(self.total_capital_spin)
+        param_layout.addLayout(total_capital_layout)
+
         # 建仓日期
         start_date_layout = QHBoxLayout()
         start_date_label = QLabel("建仓日期:")
@@ -267,7 +301,7 @@ class MainWindow(QMainWindow):
 
         self.buy_threshold_spin = QDoubleSpinBox()
         self.buy_threshold_spin.setRange(1.0, 8.0)
-        self.buy_threshold_spin.setValue(5.0)
+        self.buy_threshold_spin.setValue(4.0)  # 默认4%
         self.buy_threshold_spin.setSingleStep(0.5)
         self.buy_threshold_spin.setDecimals(1)
         self.buy_threshold_spin.setSuffix("%")
@@ -283,13 +317,45 @@ class MainWindow(QMainWindow):
 
         self.sell_threshold_spin = QDoubleSpinBox()
         self.sell_threshold_spin.setRange(1.0, 10.0)
-        self.sell_threshold_spin.setValue(5.0)
+        self.sell_threshold_spin.setValue(2.0)  # 默认2%
         self.sell_threshold_spin.setSingleStep(0.5)
         self.sell_threshold_spin.setDecimals(1)
         self.sell_threshold_spin.setSuffix("%")
         self.sell_threshold_spin.setFont(QFont("Microsoft YaHei", 9))
         sell_threshold_layout.addWidget(self.sell_threshold_spin)
         param_layout.addLayout(sell_threshold_layout)
+
+        # 最多连续买入次数
+        max_buy_layout = QHBoxLayout()
+        max_buy_label = QLabel("最多连续买入:")
+        max_buy_label.setFont(QFont("Microsoft YaHei", 9))
+        max_buy_layout.addWidget(max_buy_label)
+
+        self.max_buy_spin = QDoubleSpinBox()
+        self.max_buy_spin.setRange(1.0, 10.0)
+        self.max_buy_spin.setValue(5.0)  # 默认5次
+        self.max_buy_spin.setSingleStep(1.0)
+        self.max_buy_spin.setDecimals(0)
+        self.max_buy_spin.setSuffix(" 次")
+        self.max_buy_spin.setFont(QFont("Microsoft YaHei", 9))
+        max_buy_layout.addWidget(self.max_buy_spin)
+        param_layout.addLayout(max_buy_layout)
+
+        # 最多连续卖出次数
+        max_sell_layout = QHBoxLayout()
+        max_sell_label = QLabel("最多连续卖出:")
+        max_sell_label.setFont(QFont("Microsoft YaHei", 9))
+        max_sell_layout.addWidget(max_sell_label)
+
+        self.max_sell_spin = QDoubleSpinBox()
+        self.max_sell_spin.setRange(1.0, 10.0)
+        self.max_sell_spin.setValue(5.0)  # 默认5次
+        self.max_sell_spin.setSingleStep(1.0)
+        self.max_sell_spin.setDecimals(0)
+        self.max_sell_spin.setSuffix(" 次")
+        self.max_sell_spin.setFont(QFont("Microsoft YaHei", 9))
+        max_sell_layout.addWidget(self.max_sell_spin)
+        param_layout.addLayout(max_sell_layout)
 
         # 操作按钮
         button_layout = QHBoxLayout()
@@ -333,10 +399,10 @@ class MainWindow(QMainWindow):
         # 投资规则说明
         info_label = QLabel(
             "投资规则:\n"
-            "• 总资金: 20000元\n"
-            "• 初始建仓: 5000元\n"
-            "• 最多买入5次，均值3000元\n"
-            "• 最多卖出3次，均值4000元"
+            "• 总资金可配置（默认10000元）\n"
+            "• 初始建仓为总资金的25%\n"
+            "• 连续买入限制: 最多连续买入N次后必须等待上涨卖出\n"
+            "• 连续卖出限制: 最多连续卖出N次后必须等待下跌买入"
         )
         info_label.setFont(QFont("Microsoft YaHei", 8))
         info_label.setStyleSheet("color: #6b7280;")
@@ -443,6 +509,9 @@ class MainWindow(QMainWindow):
         end_date = self.end_date_edit.date().toPyDate()
         buy_threshold = self.buy_threshold_spin.value() / 100.0
         sell_threshold = self.sell_threshold_spin.value() / 100.0
+        total_capital = self.total_capital_spin.value()
+        max_consecutive_buy = int(self.max_buy_spin.value())
+        max_consecutive_sell = int(self.max_sell_spin.value())
 
         # 验证日期
         if start_date >= end_date:
@@ -463,6 +532,9 @@ class MainWindow(QMainWindow):
             end_date=end_date,
             buy_threshold=buy_threshold,
             sell_threshold=sell_threshold,
+            total_capital=total_capital,
+            max_consecutive_buy=max_consecutive_buy,
+            max_consecutive_sell=max_consecutive_sell,
         )
         self.strategy_worker.moveToThread(self.strategy_thread)
 
@@ -519,9 +591,12 @@ class MainWindow(QMainWindow):
         if self.optimizer_thread is not None and self.optimizer_thread.isRunning():
             return
 
-        # 获取日期参数
+        # 获取参数
         start_date = self.start_date_edit.date().toPyDate()
         end_date = self.end_date_edit.date().toPyDate()
+        total_capital = self.total_capital_spin.value()
+        max_consecutive_buy = int(self.max_buy_spin.value())
+        max_consecutive_sell = int(self.max_sell_spin.value())
 
         # 验证日期
         if start_date >= end_date:
@@ -544,6 +619,9 @@ class MainWindow(QMainWindow):
             start_date=start_date,
             end_date=end_date,
             quick_mode=True,
+            total_capital=total_capital,
+            max_consecutive_buy=max_consecutive_buy,
+            max_consecutive_sell=max_consecutive_sell,
         )
         self.optimizer_worker.moveToThread(self.optimizer_thread)
 

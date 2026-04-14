@@ -6,9 +6,11 @@
 - `develop`：开发主分支，日常集成代码
 - `feature/*`：功能分支，从 `develop` 拉取，开发完成后合并回 `develop`
 
+**开发前请先拉取最新代码**，避免在过时分支上开发，减少与他人的冲突。开始新功能前、合并前、切换分支前，都建议先 `git fetch` / `git pull` 同步远程。
+
 ## 1. 新功能开发（feature）
 
-从 `develop` 创建功能分支：
+从 `develop` 创建功能分支（先切到 `develop` 并拉取最新）：
 
 ```bash
 git checkout develop
