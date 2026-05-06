@@ -53,25 +53,26 @@ class StrategyResult:
 
 
 class InvestmentStrategy:
-    """阶梯买卖投资策略
+    """阶梯买卖投资策略（循环高抛低吸）
 
     投资规则：
     - 总资金可配置（默认1万元）
     - 初始建仓为总资金的25%
-    - 剩余资金按阶梯比例分配
-    - 连续买入限制：最多连续买入N次后必须等待上涨卖出
-    - 连续卖出限制：最多连续卖出N次后必须等待下跌买入
-    - 买入触发：净值下跌达到设定比例
-    - 卖出触发：净值上涨达到设定比例
+    - 买入触发：净值下跌达到设定比例，按连续阶梯比例买入当前现金（越跌越重仓）
+    - 卖出触发：净值上涨达到设定比例，按比例减仓
+    - 连续买入限制：最多连续买入N次后停止加仓
+    - 连续卖出限制：最多连续卖出N次后停止减仓
+    - 任意一次卖出后重置连续买入计数，可开启新一轮加仓（循环）
+    - 任意一次买入后重置连续卖出计数
     """
 
-    # 默认参数
     DEFAULT_TOTAL_CAPITAL = 10000.0
     INITIAL_INVESTMENT_RATIO = 0.25  # 初始建仓比例（总资金的25%）
 
-    # 阶梯买入金额比例（相对于剩余资金的分配）
-    BUY_RATIOS = [0.20, 0.20, 0.20, 0.20, 0.20]  # 5次平均分配剩余资金的75%
-    SELL_RATIOS = [0.25, 0.25, 0.25, 0.25]  # 卖出份额比例
+    # 阶梯买入比例（基于当前现金，越跌比例越大）
+    BUY_RATIOS = [0.10, 0.20, 0.30, 0.40, 0.50]
+    # 卖出份额比例（基于当前持仓）
+    SELL_RATIOS = [0.25, 0.25, 0.25, 0.25]
 
     def __init__(
         self,
@@ -83,6 +84,7 @@ class InvestmentStrategy:
         total_capital: float = None,
         max_consecutive_buy: int = 5,
         max_consecutive_sell: int = 5,
+        buy_ratios: list[float] | None = None,
     ) -> None:
         """初始化投资策略
 
@@ -93,8 +95,9 @@ class InvestmentStrategy:
             buy_threshold: 下跌买入比例（如 0.05 表示 5%）
             sell_threshold: 上涨卖出比例（如 0.05 表示 5%）
             total_capital: 总资金（默认10000元）
-            max_consecutive_buy: 最多连续买入次数
-            max_consecutive_sell: 最多连续卖出次数
+            max_consecutive_buy: 最多连续买入次数（卖出后重置，可再次买入）
+            max_consecutive_sell: 最多连续卖出次数（买入后重置，可再次卖出）
+            buy_ratios: 阶梯买入比例列表（基于当前现金），默认 [0.10, 0.20, 0.30, 0.40, 0.50]
         """
         self.nav_data = nav_data.copy()
         self.start_date = pd.Timestamp(start_date)
@@ -104,17 +107,10 @@ class InvestmentStrategy:
         self.total_capital = total_capital or self.DEFAULT_TOTAL_CAPITAL
         self.max_consecutive_buy = max_consecutive_buy
         self.max_consecutive_sell = max_consecutive_sell
+        self.buy_ratios = buy_ratios if buy_ratios is not None else self.BUY_RATIOS
 
-        # 计算初始建仓金额和剩余资金
+        # 计算初始建仓金额
         self.initial_investment = self.total_capital * self.INITIAL_INVESTMENT_RATIO
-        self.remaining_for_trading = self.total_capital - self.initial_investment
-
-        # 根据剩余资金和比例计算实际买入金额
-        self.buy_amounts = [
-            self.remaining_for_trading * ratio for ratio in self.BUY_RATIOS
-        ]
-        self.max_buy_count = max_consecutive_buy
-        self.max_sell_count = max_consecutive_sell
 
         # 确保数据类型正确
         self.nav_data["净值日期"] = pd.to_datetime(self.nav_data["净值日期"])
@@ -132,20 +128,19 @@ class InvestmentStrategy:
     def execute(self) -> StrategyResult:
         """执行投资策略，返回结果
 
-        连续买卖规则：
-        - 连续买入：下跌时最多连续买入N次，之后必须等待上涨卖出后才能再次买入
-        - 连续卖出：上涨时最多连续卖出N次，之后必须等待下跌买入后才能再次卖出
+        循环规则：
+        - 连续下跌最多买入N次后停止加仓；任意一次卖出后重置买入计数，开启新一轮
+        - 连续上涨最多卖出N次后停止减仓；任意一次买入后重置卖出计数
+        - 买入金额按阶梯动态计算：第k次连续买入使用 buy_ratios[k-1] × 当前现金
         """
         trades: list[TradeRecord] = []
 
-        # 初始资金状态
         cash = self.total_capital
         shares = 0.0
-        buy_count = 0
-        sell_count = 0
-        consecutive_buy_count = 0  # 当前连续买入次数
-        consecutive_sell_count = 0  # 当前连续卖出次数
-        last_trade_type = None  # 上次交易类型（用于判断连续性）
+        buy_count = 0  # 统计：总买入次数
+        sell_count = 0  # 统计：总卖出次数
+        consecutive_buy_count = 0  # 当前连续买入次数（卖出后归零）
+        consecutive_sell_count = 0  # 当前连续卖出次数（买入后归零）
         reference_nav = None
 
         # 1. 在建仓日期买入初始金额
@@ -155,7 +150,7 @@ class InvestmentStrategy:
         shares += initial_shares
         cash -= self.initial_investment
         reference_nav = initial_nav
-        last_trade_type = TradeType.INITIAL
+        # 建仓不计入连续买入计数，保持为0，确保首次条件买入使用 buy_ratios[0]
 
         trades.append(
             TradeRecord(
@@ -176,36 +171,24 @@ class InvestmentStrategy:
             current_nav = float(row["unit_nav"])
             current_date = row["净值日期"].date()
 
-            # 判断是否可以买入（考虑连续买入限制）
-            # 条件1: 总买入次数未达上限
-            # 条件2: 当前净值 <= 参考净值 * (1 - 买入比例)
-            # 条件3: 现金足够
-            # 条件4: 未达到连续买入上限，或者上次是卖出操作（重置连续计数）
+            # 计算本次买入金额（基于当前现金的阶梯比例）
+            ratio_idx = min(consecutive_buy_count, len(self.buy_ratios) - 1)
+            buy_amount = cash * self.buy_ratios[ratio_idx]
+
             can_buy = (
-                buy_count < self.max_buy_count
-                and current_nav <= reference_nav * (1 - self.buy_threshold)
-                and cash >= self.buy_amounts[buy_count]
-                and (
-                    consecutive_buy_count < self.max_consecutive_buy
-                    or last_trade_type in [TradeType.SELL, TradeType.INITIAL]
-                )
+                current_nav <= reference_nav * (1 - self.buy_threshold)
+                and cash > 0
+                and buy_amount > 0
+                and consecutive_buy_count < self.max_consecutive_buy
             )
 
             if can_buy:
-                buy_amount = self.buy_amounts[buy_count]
                 buy_shares = buy_amount / current_nav
                 shares += buy_shares
                 cash -= buy_amount
                 buy_count += 1
-
-                # 更新连续买入计数
-                if last_trade_type in [TradeType.BUY, TradeType.INITIAL]:
-                    consecutive_buy_count += 1
-                else:
-                    consecutive_buy_count = 1  # 卖出后首次买入，重新开始计数
-                    consecutive_sell_count = 0  # 重置连续卖出计数
-
-                last_trade_type = TradeType.BUY
+                consecutive_buy_count += 1
+                consecutive_sell_count = 0  # 买入后重置连续卖出计数
                 reference_nav = current_nav
 
                 trades.append(
@@ -215,45 +198,37 @@ class InvestmentStrategy:
                         nav=current_nav,
                         amount=buy_amount,
                         shares=buy_shares,
-                        total_cost=sum(t.amount for t in trades),
+                        total_cost=sum(
+                            t.amount for t in trades if t.trade_type != TradeType.SELL
+                        ),
                         remaining_cash=cash,
-                        note=f"第{buy_count}次买入(连续{consecutive_buy_count}次)，触发下跌 {self.buy_threshold*100:.1f}%",
+                        note=(
+                            f"第{buy_count}次买入(连续第{consecutive_buy_count}次，"
+                            f"用{self.buy_ratios[ratio_idx]*100:.0f}%现金)，"
+                            f"触发下跌 {self.buy_threshold*100:.1f}%"
+                        ),
                     )
                 )
-                continue  # 买入后跳过当天，继续下一天
+                continue  # 买入后跳过当天卖出判断
 
-            # 判断是否可以卖出（考虑连续卖出限制）
-            # 条件1: 总卖出次数未达上限
-            # 条件2: 持有份额 > 0
-            # 条件3: 当前净值 >= 参考净值 * (1 + 卖出比例)
-            # 条件4: 未达到连续卖出上限，或者上次是买入操作（重置连续计数）
+            # 卖出判断
+            sell_ratio_idx = min(consecutive_sell_count, len(self.SELL_RATIOS) - 1)
+            sell_ratio = self.SELL_RATIOS[sell_ratio_idx]
+
             can_sell = (
-                sell_count < self.max_sell_count
-                and shares > 0
+                shares > 0
                 and current_nav >= reference_nav * (1 + self.sell_threshold)
-                and (
-                    consecutive_sell_count < self.max_consecutive_sell
-                    or last_trade_type in [TradeType.BUY, TradeType.INITIAL]
-                )
+                and consecutive_sell_count < self.max_consecutive_sell
             )
 
             if can_sell:
-                # 计算卖出份额（卖出持有份额的一定比例）
-                sell_ratio = self.SELL_RATIOS[sell_count] if sell_count < len(self.SELL_RATIOS) else 0.25
                 sell_shares = shares * sell_ratio
                 sell_amount = sell_shares * current_nav
                 shares -= sell_shares
                 cash += sell_amount
                 sell_count += 1
-
-                # 更新连续卖出计数
-                if last_trade_type in [TradeType.SELL]:
-                    consecutive_sell_count += 1
-                else:
-                    consecutive_sell_count = 1  # 买入后首次卖出，重新开始计数
-                    consecutive_buy_count = 0  # 重置连续买入计数
-
-                last_trade_type = TradeType.SELL
+                consecutive_sell_count += 1
+                consecutive_buy_count = 0  # 卖出后重置连续买入计数（开启新一轮）
                 reference_nav = current_nav
 
                 trades.append(
@@ -267,7 +242,11 @@ class InvestmentStrategy:
                             t.amount for t in trades if t.trade_type != TradeType.SELL
                         ),
                         remaining_cash=cash,
-                        note=f"第{sell_count}次卖出(连续{consecutive_sell_count}次)，触发上涨 {self.sell_threshold*100:.1f}%",
+                        note=(
+                            f"第{sell_count}次卖出(连续第{consecutive_sell_count}次，"
+                            f"减仓{sell_ratio*100:.0f}%持仓)，"
+                            f"触发上涨 {self.sell_threshold*100:.1f}%"
+                        ),
                     )
                 )
 
@@ -300,17 +279,13 @@ class InvestmentStrategy:
         final_value = cash
         total_return_rate = (final_value - self.total_capital) / self.total_capital
 
-        # 统计买卖次数（不含建仓和清仓）
-        actual_buy_count = sum(1 for t in trades if t.trade_type == TradeType.BUY)
-        actual_sell_count = sum(1 for t in trades if t.trade_type == TradeType.SELL)
-
         return StrategyResult(
             trades=trades,
             total_investment=self.total_capital,
             final_value=final_value,
             total_return_rate=total_return_rate,
-            buy_count=actual_buy_count,
-            sell_count=actual_sell_count,
+            buy_count=buy_count,
+            sell_count=sell_count,
             remaining_shares=shares,
             remaining_cash=cash,
             start_date=self.start_date.date(),
