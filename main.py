@@ -6,6 +6,8 @@ from PyQt6.QtWidgets import QApplication
 
 from ui.main_window import MainWindow
 
+print("当前运行的 Python 环境是:", sys.executable)
+
 
 def main() -> int:
     app = QApplication(sys.argv)
