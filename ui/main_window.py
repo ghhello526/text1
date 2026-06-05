@@ -1,679 +1,431 @@
+"""主窗口 — 守基宝交易辅助系统"""
+
 from __future__ import annotations
 
-from datetime import date, datetime
-from typing import TYPE_CHECKING
-
-from PyQt6.QtCore import QObject, QThread, pyqtSignal
+from PyQt6.QtCore import QObject, Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
-    QDateEdit,
+    QDialog,
+    QDialogButtonBox,
     QDoubleSpinBox,
-    QGroupBox,
+    QFormLayout,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMainWindow,
     QMessageBox,
-    QPlainTextEdit,
-    QProgressBar,
     QPushButton,
     QSplitter,
+    QStackedWidget,
     QStatusBar,
     QVBoxLayout,
     QWidget,
 )
 
-from services.fund_service import FundDataError, FundHistory, FundService
-from services.investment_strategy import InvestmentStrategy, format_strategy_result
-from services.optimizer import StrategyOptimizer, format_optimization_result
-from ui.chart_widget import ChartWidget
+from services.database import DatabaseManager
+from services.fund_service import FundDataError, FundService
+from services.models import Fund, SignalAction, TradingSignal
+from services.signal_generator import SignalGenerator
+from ui.backtest_panel import BacktestPanel
+from ui.fund_list_panel import FundListPanel, MAX_FUNDS
+from ui.trade_panel import TradePanel
 
-if TYPE_CHECKING:
-    from services.investment_strategy import StrategyResult
-    from services.optimizer import OptimizationResult
 
+class SignalRefreshWorker(QObject):
+    """后台刷新所有基金信号"""
 
-class FundQueryWorker(QObject):
-    finished = pyqtSignal(object)
+    finished = pyqtSignal(object)  # dict[int, TradingSignal]
     failed = pyqtSignal(str)
 
-    def __init__(self, service: FundService, code: str) -> None:
+    def __init__(self, signal_gen: SignalGenerator) -> None:
         super().__init__()
-        self.service = service
-        self.code = code
+        self.signal_gen = signal_gen
 
     def run(self) -> None:
         try:
-            history = self.service.get_fund_history(self.code)
-            self.finished.emit(history)
-        except FundDataError as exc:
+            signals = self.signal_gen.refresh_all_signals()
+            self.finished.emit(signals)
+        except Exception as exc:
             self.failed.emit(str(exc))
-        except Exception as exc:
-            self.failed.emit(f"未知错误：{exc}")
-
-
-class StrategyWorker(QObject):
-    """策略计算工作线程"""
-
-    finished = pyqtSignal(object)
-    failed = pyqtSignal(str)
-
-    def __init__(
-        self,
-        nav_data,
-        start_date: date,
-        end_date: date,
-        buy_threshold: float,
-        sell_threshold: float,
-        total_capital: float = 10000.0,
-        max_consecutive_buy: int = 5,
-        max_consecutive_sell: int = 5,
-    ) -> None:
-        super().__init__()
-        self.nav_data = nav_data
-        self.start_date = start_date
-        self.end_date = end_date
-        self.buy_threshold = buy_threshold
-        self.sell_threshold = sell_threshold
-        self.total_capital = total_capital
-        self.max_consecutive_buy = max_consecutive_buy
-        self.max_consecutive_sell = max_consecutive_sell
-
-    def run(self) -> None:
-        try:
-            strategy = InvestmentStrategy(
-                nav_data=self.nav_data,
-                start_date=self.start_date,
-                end_date=self.end_date,
-                buy_threshold=self.buy_threshold,
-                sell_threshold=self.sell_threshold,
-                total_capital=self.total_capital,
-                max_consecutive_buy=self.max_consecutive_buy,
-                max_consecutive_sell=self.max_consecutive_sell,
-            )
-            result = strategy.execute()
-            self.finished.emit(result)
-        except Exception as exc:
-            self.failed.emit(f"策略计算失败：{exc}")
-
-
-class OptimizerWorker(QObject):
-    """优化器工作线程"""
-
-    finished = pyqtSignal(object)
-    failed = pyqtSignal(str)
-    progress = pyqtSignal(int)
-
-    def __init__(
-        self,
-        nav_data,
-        start_date: date,
-        end_date: date,
-        quick_mode: bool = True,
-        total_capital: float = 10000.0,
-        max_consecutive_buy: int = 5,
-        max_consecutive_sell: int = 5,
-    ) -> None:
-        super().__init__()
-        self.nav_data = nav_data
-        self.start_date = start_date
-        self.end_date = end_date
-        self.quick_mode = quick_mode
-        self.total_capital = total_capital
-        self.max_consecutive_buy = max_consecutive_buy
-        self.max_consecutive_sell = max_consecutive_sell
-
-    def run(self) -> None:
-        try:
-            optimizer = StrategyOptimizer(
-                nav_data=self.nav_data,
-                start_date=self.start_date,
-                end_date=self.end_date,
-                total_capital=self.total_capital,
-                max_consecutive_buy=self.max_consecutive_buy,
-                max_consecutive_sell=self.max_consecutive_sell,
-            )
-
-            if self.quick_mode:
-                result = optimizer.optimize_quick()
-            else:
-                result = optimizer.optimize()
-
-            self.finished.emit(result)
-        except Exception as exc:
-            self.failed.emit(f"优化失败：{exc}")
 
 
 class MainWindow(QMainWindow):
+    """守基宝交易辅助系统主窗口"""
+
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("基金投资分析上位机")
-        self.resize(1400, 800)
+        self.setWindowTitle("守基宝 4% 定投法 — 交易辅助系统")
+        self.resize(1400, 850)
         self.setMinimumSize(1100, 700)
 
         # 服务实例
+        self.db = DatabaseManager()
         self.fund_service = FundService()
+        self.signal_gen = SignalGenerator(db=self.db, fund_service=self.fund_service)
 
-        # 当前数据
-        self.current_history: FundHistory | None = None
-        self.current_strategy_result: StrategyResult | None = None
-
-        # 线程
-        self.query_thread: QThread | None = None
-        self.query_worker: FundQueryWorker | None = None
-        self.strategy_thread: QThread | None = None
-        self.strategy_worker: StrategyWorker | None = None
-        self.optimizer_thread: QThread | None = None
-        self.optimizer_worker: OptimizerWorker | None = None
+        # 当前状态
+        self._current_mode = "trade"  # "trade" or "backtest"
+        self._signals: dict[int, TradingSignal] = {}
+        self._refresh_thread: QThread | None = None
+        self._refresh_worker: SignalRefreshWorker | None = None
 
         # 构建UI
         self._build_ui()
+        # 加载数据
+        self._load_funds()
 
     def _build_ui(self) -> None:
-        """构建主界面"""
-        # 中央部件
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
+        central = QWidget()
+        self.setCentralWidget(central)
 
-        # 主布局：左右分栏
-        main_layout = QHBoxLayout(central_widget)
-        main_layout.setContentsMargins(12, 12, 12, 12)
-        main_layout.setSpacing(10)
+        main_layout = QVBoxLayout(central)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
 
-        # 创建分割器
+        # ===== 顶部工具栏 =====
+        toolbar = QWidget()
+        toolbar.setFixedHeight(50)
+        toolbar.setStyleSheet("background-color: #1e293b;")
+        toolbar_layout = QHBoxLayout(toolbar)
+        toolbar_layout.setContentsMargins(16, 8, 16, 8)
+        toolbar_layout.setSpacing(12)
+
+        # 应用标题
+        title = QLabel("守基宝")
+        title.setFont(QFont("Microsoft YaHei", 12, QFont.Weight.Bold))
+        title.setStyleSheet("color: #f8fafc;")
+        toolbar_layout.addWidget(title)
+
+        toolbar_layout.addSpacing(24)
+
+        # 模式切换按钮
+        self.trade_btn = QPushButton("实时交易")
+        self.trade_btn.setFixedSize(100, 34)
+        self.trade_btn.setFont(QFont("Microsoft YaHei", 10))
+        self.trade_btn.setCheckable(True)
+        self.trade_btn.setChecked(True)
+        self.trade_btn.clicked.connect(lambda: self._switch_mode("trade"))
+        toolbar_layout.addWidget(self.trade_btn)
+
+        self.backtest_btn = QPushButton("策略回测")
+        self.backtest_btn.setFixedSize(100, 34)
+        self.backtest_btn.setFont(QFont("Microsoft YaHei", 10))
+        self.backtest_btn.setCheckable(True)
+        self.backtest_btn.clicked.connect(lambda: self._switch_mode("backtest"))
+        toolbar_layout.addWidget(self.backtest_btn)
+
+        toolbar_layout.addStretch()
+
+        # 刷新按钮
+        self.refresh_btn = QPushButton("刷新信号")
+        self.refresh_btn.setFixedSize(90, 34)
+        self.refresh_btn.setFont(QFont("Microsoft YaHei", 9))
+        self.refresh_btn.clicked.connect(self._refresh_signals)
+        toolbar_layout.addWidget(self.refresh_btn)
+
+        self._update_toolbar_style()
+        main_layout.addWidget(toolbar)
+
+        # ===== 主体：左右分栏 =====
+        body = QWidget()
+        body_layout = QHBoxLayout(body)
+        body_layout.setContentsMargins(8, 8, 8, 8)
+        body_layout.setSpacing(8)
+
         splitter = QSplitter()
-        main_layout.addWidget(splitter)
+        body_layout.addWidget(splitter)
 
-        # 左侧：图表区域（70%宽度）
-        left_panel = self._build_left_panel()
-        splitter.addWidget(left_panel)
+        # 左侧基金列表
+        self.fund_list = FundListPanel()
+        self.fund_list.fund_selected.connect(self._on_fund_selected)
+        self.fund_list.add_fund_requested.connect(self._add_fund_dialog)
+        self.fund_list.settings_requested.connect(self._settings_dialog)
+        splitter.addWidget(self.fund_list)
 
-        # 右侧：参数和控制区域（30%宽度）
-        right_panel = self._build_right_panel()
-        splitter.addWidget(right_panel)
+        # 右侧面板栈
+        self.panel_stack = QStackedWidget()
+        self.trade_panel = TradePanel()
+        self.trade_panel.confirm_trade.connect(self._on_confirm_trade)
+        self.trade_panel.skip_trade.connect(self._on_skip_trade)
+        self.panel_stack.addWidget(self.trade_panel)  # index 0
 
-        # 设置分割比例
-        splitter.setSizes([1000, 400])
+        self.backtest_panel = BacktestPanel()
+        self.panel_stack.addWidget(self.backtest_panel)  # index 1
+
+        splitter.addWidget(self.panel_stack)
+        splitter.setSizes([220, 1100])
+
+        main_layout.addWidget(body, stretch=1)
 
         # 状态栏
         self.status = QStatusBar()
         self.setStatusBar(self.status)
-        self.status.showMessage("就绪 - 请输入基金代码查询")
+        self.status.showMessage("就绪")
 
-    def _build_left_panel(self) -> QWidget:
-        """构建左侧面板（图表区域）"""
-        panel = QWidget()
-        layout = QVBoxLayout(panel)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(10)
-
-        # 基金代码查询栏
-        query_bar = QHBoxLayout()
-        query_bar.setSpacing(8)
-
-        code_label = QLabel("基金代码:")
-        code_label.setFont(QFont("Microsoft YaHei", 10))
-        query_bar.addWidget(code_label)
-
-        self.code_input = QLineEdit()
-        self.code_input.setPlaceholderText("请输入 6 位基金代码，例如 161725")
-        self.code_input.setMaxLength(6)
-        self.code_input.setFixedHeight(34)
-        self.code_input.setFont(QFont("Microsoft YaHei", 10))
-        self.code_input.setText("161725")
-        self.code_input.returnPressed.connect(self.query_fund)
-        query_bar.addWidget(self.code_input, stretch=1)
-
-        self.query_button = QPushButton("查询净值")
-        self.query_button.setFixedHeight(34)
-        self.query_button.setFont(QFont("Microsoft YaHei", 10))
-        self.query_button.clicked.connect(self.query_fund)
-        query_bar.addWidget(self.query_button)
-
-        layout.addLayout(query_bar)
-
-        # 图表控件
-        self.chart = ChartWidget()
-        layout.addWidget(self.chart, stretch=1)
-
-        return panel
-
-    def _build_right_panel(self) -> QWidget:
-        """构建右侧面板（参数和结果区域）"""
-        panel = QWidget()
-        layout = QVBoxLayout(panel)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(10)
-
-        # ===== 参数输入组 =====
-        param_group = QGroupBox("投资参数设置")
-        param_group.setFont(QFont("Microsoft YaHei", 10, QFont.Weight.Bold))
-        param_layout = QVBoxLayout(param_group)
-        param_layout.setSpacing(10)
-
-        # 总资金
-        total_capital_layout = QHBoxLayout()
-        total_capital_label = QLabel("总资金:")
-        total_capital_label.setFont(QFont("Microsoft YaHei", 9))
-        total_capital_layout.addWidget(total_capital_label)
-
-        self.total_capital_spin = QDoubleSpinBox()
-        self.total_capital_spin.setRange(1000.0, 1000000.0)
-        self.total_capital_spin.setValue(10000.0)  # 默认值1万
-        self.total_capital_spin.setSingleStep(1000.0)
-        self.total_capital_spin.setDecimals(0)
-        self.total_capital_spin.setSuffix(" 元")
-        self.total_capital_spin.setFont(QFont("Microsoft YaHei", 9))
-        total_capital_layout.addWidget(self.total_capital_spin)
-        param_layout.addLayout(total_capital_layout)
-
-        # 建仓日期
-        start_date_layout = QHBoxLayout()
-        start_date_label = QLabel("建仓日期:")
-        start_date_label.setFont(QFont("Microsoft YaHei", 9))
-        start_date_layout.addWidget(start_date_label)
-
-        self.start_date_edit = QDateEdit()
-        self.start_date_edit.setCalendarPopup(True)
-        self.start_date_edit.setDate(date.today().replace(year=date.today().year - 1))
-        self.start_date_edit.setFont(QFont("Microsoft YaHei", 9))
-        start_date_layout.addWidget(self.start_date_edit)
-        param_layout.addLayout(start_date_layout)
-
-        # 清仓日期
-        end_date_layout = QHBoxLayout()
-        end_date_label = QLabel("清仓日期:")
-        end_date_label.setFont(QFont("Microsoft YaHei", 9))
-        end_date_layout.addWidget(end_date_label)
-
-        self.end_date_edit = QDateEdit()
-        self.end_date_edit.setCalendarPopup(True)
-        self.end_date_edit.setDate(date.today())
-        self.end_date_edit.setFont(QFont("Microsoft YaHei", 9))
-        end_date_layout.addWidget(self.end_date_edit)
-        param_layout.addLayout(end_date_layout)
-
-        # 下跌买入比例
-        buy_threshold_layout = QHBoxLayout()
-        buy_threshold_label = QLabel("下跌买入比例:")
-        buy_threshold_label.setFont(QFont("Microsoft YaHei", 9))
-        buy_threshold_layout.addWidget(buy_threshold_label)
-
-        self.buy_threshold_spin = QDoubleSpinBox()
-        self.buy_threshold_spin.setRange(1.0, 8.0)
-        self.buy_threshold_spin.setValue(4.0)  # 默认4%
-        self.buy_threshold_spin.setSingleStep(0.5)
-        self.buy_threshold_spin.setDecimals(1)
-        self.buy_threshold_spin.setSuffix("%")
-        self.buy_threshold_spin.setFont(QFont("Microsoft YaHei", 9))
-        buy_threshold_layout.addWidget(self.buy_threshold_spin)
-        param_layout.addLayout(buy_threshold_layout)
-
-        # 上涨卖出比例
-        sell_threshold_layout = QHBoxLayout()
-        sell_threshold_label = QLabel("上涨卖出比例:")
-        sell_threshold_label.setFont(QFont("Microsoft YaHei", 9))
-        sell_threshold_layout.addWidget(sell_threshold_label)
-
-        self.sell_threshold_spin = QDoubleSpinBox()
-        self.sell_threshold_spin.setRange(1.0, 10.0)
-        self.sell_threshold_spin.setValue(2.0)  # 默认2%
-        self.sell_threshold_spin.setSingleStep(0.5)
-        self.sell_threshold_spin.setDecimals(1)
-        self.sell_threshold_spin.setSuffix("%")
-        self.sell_threshold_spin.setFont(QFont("Microsoft YaHei", 9))
-        sell_threshold_layout.addWidget(self.sell_threshold_spin)
-        param_layout.addLayout(sell_threshold_layout)
-
-        # 最多连续买入次数
-        max_buy_layout = QHBoxLayout()
-        max_buy_label = QLabel("最多连续买入:")
-        max_buy_label.setFont(QFont("Microsoft YaHei", 9))
-        max_buy_layout.addWidget(max_buy_label)
-
-        self.max_buy_spin = QDoubleSpinBox()
-        self.max_buy_spin.setRange(1.0, 10.0)
-        self.max_buy_spin.setValue(5.0)  # 默认5次
-        self.max_buy_spin.setSingleStep(1.0)
-        self.max_buy_spin.setDecimals(0)
-        self.max_buy_spin.setSuffix(" 次")
-        self.max_buy_spin.setFont(QFont("Microsoft YaHei", 9))
-        max_buy_layout.addWidget(self.max_buy_spin)
-        param_layout.addLayout(max_buy_layout)
-
-        # 最多连续卖出次数
-        max_sell_layout = QHBoxLayout()
-        max_sell_label = QLabel("最多连续卖出:")
-        max_sell_label.setFont(QFont("Microsoft YaHei", 9))
-        max_sell_layout.addWidget(max_sell_label)
-
-        self.max_sell_spin = QDoubleSpinBox()
-        self.max_sell_spin.setRange(1.0, 10.0)
-        self.max_sell_spin.setValue(5.0)  # 默认5次
-        self.max_sell_spin.setSingleStep(1.0)
-        self.max_sell_spin.setDecimals(0)
-        self.max_sell_spin.setSuffix(" 次")
-        self.max_sell_spin.setFont(QFont("Microsoft YaHei", 9))
-        max_sell_layout.addWidget(self.max_sell_spin)
-        param_layout.addLayout(max_sell_layout)
-
-        # 操作按钮
-        button_layout = QHBoxLayout()
-
-        self.calc_button = QPushButton("计算收益率")
-        self.calc_button.setFixedHeight(36)
-        self.calc_button.setFont(QFont("Microsoft YaHei", 10))
-        self.calc_button.setEnabled(False)
-        self.calc_button.clicked.connect(self.calculate_strategy)
-        button_layout.addWidget(self.calc_button)
-
-        self.optimize_button = QPushButton("自动优化参数")
-        self.optimize_button.setFixedHeight(36)
-        self.optimize_button.setFont(QFont("Microsoft YaHei", 10))
-        self.optimize_button.setEnabled(False)
-        self.optimize_button.clicked.connect(self.optimize_parameters)
-        button_layout.addWidget(self.optimize_button)
-
-        param_layout.addLayout(button_layout)
-
-        # 优化进度条
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setVisible(False)
-        param_layout.addWidget(self.progress_bar)
-
-        layout.addWidget(param_group)
-
-        # ===== 结果显示组 =====
-        result_group = QGroupBox("投资分析结果")
-        result_group.setFont(QFont("Microsoft YaHei", 10, QFont.Weight.Bold))
-        result_layout = QVBoxLayout(result_group)
-
-        self.result_text = QPlainTextEdit()
-        self.result_text.setReadOnly(True)
-        self.result_text.setFont(QFont("Microsoft YaHei", 9))
-        self.result_text.setPlaceholderText("请先查询基金净值，然后设置参数并点击计算...")
-        result_layout.addWidget(self.result_text)
-
-        layout.addWidget(result_group, stretch=1)
-
-        # 投资规则说明
-        info_label = QLabel(
-            "投资规则:\n"
-            "• 总资金可配置（默认10000元）\n"
-            "• 初始建仓为总资金的25%\n"
-            "• 连续买入限制: 最多连续买入N次后必须等待上涨卖出\n"
-            "• 连续卖出限制: 最多连续卖出N次后必须等待下跌买入"
+    def _update_toolbar_style(self) -> None:
+        """更新工具栏按钮的选中样式"""
+        active_style = (
+            "QPushButton { background-color: #3b82f6; color: white; "
+            "border-radius: 6px; border: none; }"
         )
-        info_label.setFont(QFont("Microsoft YaHei", 8))
-        info_label.setStyleSheet("color: #6b7280;")
-        layout.addWidget(info_label)
+        inactive_style = (
+            "QPushButton { background-color: #334155; color: #94a3b8; "
+            "border-radius: 6px; border: none; }"
+            "QPushButton:hover { background-color: #475569; color: white; }"
+        )
+        self.trade_btn.setStyleSheet(active_style if self._current_mode == "trade" else inactive_style)
+        self.backtest_btn.setStyleSheet(active_style if self._current_mode == "backtest" else inactive_style)
 
-        return panel
+    # ==================== 模式切换 ====================
 
-    # ==================== 查询功能 ====================
+    def _switch_mode(self, mode: str) -> None:
+        self._current_mode = mode
+        self.trade_btn.setChecked(mode == "trade")
+        self.backtest_btn.setChecked(mode == "backtest")
+        self._update_toolbar_style()
 
-    def query_fund(self) -> None:
-        """查询基金净值数据"""
-        if self.query_thread is not None and self.query_thread.isRunning():
+        if mode == "trade":
+            self.panel_stack.setCurrentIndex(0)
+        else:
+            self.panel_stack.setCurrentIndex(1)
+
+        # 如果有选中的基金，切换面板内容
+        fund_id = self.fund_list.get_selected_fund_id()
+        if fund_id:
+            self._on_fund_selected(fund_id)
+
+    # ==================== 数据加载 ====================
+
+    def _load_funds(self) -> None:
+        """从数据库加载所有基金到左侧列表"""
+        funds = self.db.get_all_funds()
+        self.fund_list.clear_all()
+        for fund in funds:
+            self.fund_list.add_fund_card(fund)
+
+    # ==================== 信号刷新 ====================
+
+    def _refresh_signals(self) -> None:
+        """后台刷新所有基金的信号"""
+        if self._refresh_thread and self._refresh_thread.isRunning():
             return
 
-        code = self.code_input.text().strip()
-        if not code or len(code) != 6 or not code.isdigit():
-            QMessageBox.warning(self, "输入错误", "请输入正确的6位数字基金代码")
+        self.refresh_btn.setEnabled(False)
+        self.status.showMessage("正在刷新信号...")
+
+        self._refresh_thread = QThread(self)
+        self._refresh_worker = SignalRefreshWorker(self.signal_gen)
+        self._refresh_worker.moveToThread(self._refresh_thread)
+
+        self._refresh_thread.started.connect(self._refresh_worker.run)
+        self._refresh_worker.finished.connect(self._on_signals_refreshed)
+        self._refresh_worker.failed.connect(self._on_signals_failed)
+        self._refresh_worker.finished.connect(self._cleanup_refresh)
+        self._refresh_worker.failed.connect(self._cleanup_refresh)
+        self._refresh_thread.start()
+
+    def _on_signals_refreshed(self, signals: dict[int, TradingSignal]) -> None:
+        self._signals = signals
+        self.fund_list.update_all_signals(signals)
+        self.status.showMessage(f"信号刷新完成，共 {len(signals)} 只基金")
+
+        # 如果当前有选中基金且在交易模式，更新面板
+        fund_id = self.fund_list.get_selected_fund_id()
+        if fund_id and fund_id in signals and self._current_mode == "trade":
+            self.trade_panel.update_signal(signals[fund_id])
+            trades = self.db.get_trades(fund_id)
+            self.trade_panel.update_trades(trades)
+
+    def _on_signals_failed(self, msg: str) -> None:
+        self.status.showMessage(f"信号刷新失败: {msg}")
+
+    def _cleanup_refresh(self) -> None:
+        self.refresh_btn.setEnabled(True)
+        if self._refresh_thread:
+            self._refresh_thread.quit()
+            self._refresh_thread.wait(1000)
+            self._refresh_thread.deleteLater()
+            self._refresh_thread = None
+        if self._refresh_worker:
+            self._refresh_worker.deleteLater()
+            self._refresh_worker = None
+
+    # ==================== 基金选中 ====================
+
+    def _on_fund_selected(self, fund_id: int) -> None:
+        """用户点击了某只基金"""
+        fund = self.db.get_fund(fund_id)
+        if fund is None:
             return
 
-        self.query_button.setEnabled(False)
-        self.calc_button.setEnabled(False)
-        self.optimize_button.setEnabled(False)
+        if self._current_mode == "trade":
+            # 更新交易面板
+            signal = self._signals.get(fund_id)
+            if signal:
+                self.trade_panel.update_signal(signal)
+            else:
+                self.trade_panel.clear()
+            trades = self.db.get_trades(fund_id)
+            self.trade_panel.update_trades(trades)
+        else:
+            # 更新回测面板
+            self.backtest_panel.set_fund(fund)
+
+        self.status.showMessage(f"已选中: {fund.name} ({fund.code})")
+
+    # ==================== 确认交易 ====================
+
+    def _on_confirm_trade(self) -> None:
+        """用户点击确认操作"""
+        fund_id = self.fund_list.get_selected_fund_id()
+        signal = self.trade_panel.get_current_signal()
+        if not fund_id or not signal:
+            return
+
+        try:
+            self.signal_gen.confirm_trade(fund_id, signal)
+            self.status.showMessage("交易已确认并记录")
+            # 刷新
+            trades = self.db.get_trades(fund_id)
+            self.trade_panel.update_trades(trades)
+            # 重新生成信号
+            new_signal = self.signal_gen.generate_signal(fund_id)
+            self._signals[fund_id] = new_signal
+            self.trade_panel.update_signal(new_signal)
+            self.fund_list.update_fund_signal(fund_id, new_signal)
+        except Exception as exc:
+            QMessageBox.warning(self, "操作失败", str(exc))
+
+    def _on_skip_trade(self) -> None:
+        """用户点击跳过"""
+        self.status.showMessage("已跳过本次操作建议")
+
+    # ==================== 添加基金 ====================
+
+    def _add_fund_dialog(self) -> None:
+        """弹出添加基金对话框"""
+        if self.db.get_fund_count() >= MAX_FUNDS:
+            QMessageBox.warning(self, "上限提示", f"最多支持 {MAX_FUNDS} 只基金")
+            return
+
+        code, ok = QInputDialog.getText(
+            self, "添加基金", "请输入6位基金代码:",
+        )
+        if not ok or not code:
+            return
+
+        code = code.strip()
+        if len(code) != 6 or not code.isdigit():
+            QMessageBox.warning(self, "格式错误", "请输入正确的6位数字基金代码")
+            return
+
+        # 检查是否已存在
+        if self.db.get_fund_by_code(code):
+            QMessageBox.warning(self, "重复添加", f"基金 {code} 已存在")
+            return
+
+        # 查询基金名称
         self.status.showMessage(f"正在查询基金 {code}...")
+        try:
+            history = self.fund_service.get_fund_history(code)
+            name = history.name
+        except FundDataError:
+            name = code
 
-        self.query_thread = QThread(self)
-        self.query_worker = FundQueryWorker(self.fund_service, code)
-        self.query_worker.moveToThread(self.query_thread)
+        # 弹出三线设置对话框
+        dialog = FundConfigDialog(code, name, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            fund = dialog.get_fund()
+            fund_id = self.db.add_fund(fund)
+            fund.id = fund_id
+            self.fund_list.add_fund_card(fund)
+            self.status.showMessage(f"已添加: {fund.name} ({fund.code})")
 
-        self.query_thread.started.connect(self.query_worker.run)
-        self.query_worker.finished.connect(self._on_query_success)
-        self.query_worker.failed.connect(self._on_query_failed)
-        self.query_worker.finished.connect(self._cleanup_query_thread)
-        self.query_worker.failed.connect(self._cleanup_query_thread)
-        self.query_thread.start()
+    # ==================== 资金设置 ====================
 
-    def _on_query_success(self, history: FundHistory) -> None:
-        """查询成功回调"""
-        self.current_history = history
-
-        # 绘制图表
-        self.chart.draw_history(history.code, history.name, history.dataframe)
-
-        # 更新日期选择器的范围
-        if not history.dataframe.empty:
-            min_date = history.dataframe["净值日期"].min()
-            max_date = history.dataframe["净值日期"].max()
-            self.start_date_edit.setDateRange(min_date.date(), max_date.date())
-            self.end_date_edit.setDateRange(min_date.date(), max_date.date())
-
-            # 默认选择最近一年的数据
-            default_start = max(min_date, max_date - pd.Timedelta(days=365))
-            self.start_date_edit.setDate(default_start.date())
-            self.end_date_edit.setDate(max_date.date())
-
-        # 启用计算按钮
-        self.calc_button.setEnabled(True)
-        self.optimize_button.setEnabled(True)
-
-        self.status.showMessage(
-            f"查询成功：{history.name} ({history.code})，共 {len(history.dataframe)} 条记录"
+    def _settings_dialog(self) -> None:
+        """资金设置对话框"""
+        QMessageBox.information(
+            self, "资金设置",
+            "此功能用于设置年龄、总可投资产等。\n"
+            "目前可通过每只基金的'每份金额×总份数'来控制资金分配。"
         )
 
-        # 显示基本信息
-        self.result_text.setPlainText(
-            f"基金名称: {history.name}\n"
-            f"基金代码: {history.code}\n"
-            f"数据条数: {len(history.dataframe)}\n"
-            f"数据范围: {history.dataframe['净值日期'].min().date()} ~ "
-            f"{history.dataframe['净值日期'].max().date()}\n\n"
-            f"请设置投资参数后点击计算或优化按钮。"
+
+class FundConfigDialog(QDialog):
+    """基金配置对话框（添加时设定三线）"""
+
+    def __init__(self, code: str, name: str, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(f"配置基金 - {name} ({code})")
+        self.setFixedWidth(400)
+        self._code = code
+        self._name = name
+        self._setup_ui()
+
+    def _setup_ui(self) -> None:
+        layout = QFormLayout(self)
+        layout.setSpacing(10)
+
+        self.name_edit = QLineEdit(self._name)
+        layout.addRow("基金名称:", self.name_edit)
+
+        self.opportunity_spin = QDoubleSpinBox()
+        self.opportunity_spin.setRange(0.01, 99.99)
+        self.opportunity_spin.setDecimals(4)
+        self.opportunity_spin.setValue(0.80)
+        layout.addRow("机会线净值:", self.opportunity_spin)
+
+        self.middle_spin = QDoubleSpinBox()
+        self.middle_spin.setRange(0.01, 99.99)
+        self.middle_spin.setDecimals(4)
+        self.middle_spin.setValue(1.00)
+        layout.addRow("中位线净值:", self.middle_spin)
+
+        self.danger_spin = QDoubleSpinBox()
+        self.danger_spin.setRange(0.01, 99.99)
+        self.danger_spin.setDecimals(4)
+        self.danger_spin.setValue(1.20)
+        layout.addRow("危险线净值:", self.danger_spin)
+
+        self.main_ratio_spin = QDoubleSpinBox()
+        self.main_ratio_spin.setRange(10, 90)
+        self.main_ratio_spin.setValue(60)
+        self.main_ratio_spin.setSuffix("%")
+        layout.addRow("主仓占比:", self.main_ratio_spin)
+
+        self.amount_spin = QDoubleSpinBox()
+        self.amount_spin.setRange(100, 100000)
+        self.amount_spin.setValue(1250)
+        self.amount_spin.setDecimals(0)
+        self.amount_spin.setSuffix(" 元")
+        layout.addRow("每份金额:", self.amount_spin)
+
+        self.shares_spin = QDoubleSpinBox()
+        self.shares_spin.setRange(5, 20)
+        self.shares_spin.setValue(10)
+        self.shares_spin.setDecimals(0)
+        layout.addRow("总份数:", self.shares_spin)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addRow(buttons)
 
-    def _on_query_failed(self, message: str) -> None:
-        """查询失败回调"""
-        self.status.showMessage("查询失败")
-        QMessageBox.warning(self, "查询失败", message)
-        self.result_text.setPlainText(f"查询失败: {message}")
-
-    def _cleanup_query_thread(self) -> None:
-        """清理查询线程"""
-        self.query_button.setEnabled(True)
-        if self.query_thread is not None:
-            self.query_thread.quit()
-            self.query_thread.wait(1000)
-            self.query_thread.deleteLater()
-            self.query_thread = None
-        if self.query_worker is not None:
-            self.query_worker.deleteLater()
-            self.query_worker = None
-
-    # ==================== 策略计算功能 ====================
-
-    def calculate_strategy(self) -> None:
-        """计算投资策略收益率"""
-        if self.current_history is None:
-            QMessageBox.warning(self, "提示", "请先查询基金净值数据")
-            return
-
-        if self.strategy_thread is not None and self.strategy_thread.isRunning():
-            return
-
-        # 获取参数
-        start_date = self.start_date_edit.date().toPyDate()
-        end_date = self.end_date_edit.date().toPyDate()
-        buy_threshold = self.buy_threshold_spin.value() / 100.0
-        sell_threshold = self.sell_threshold_spin.value() / 100.0
-        total_capital = self.total_capital_spin.value()
-        max_consecutive_buy = int(self.max_buy_spin.value())
-        max_consecutive_sell = int(self.max_sell_spin.value())
-
-        # 验证日期
-        if start_date >= end_date:
-            QMessageBox.warning(self, "参数错误", "建仓日期必须早于清仓日期")
-            return
-
-        # 重置图表，清除之前的买卖点标记
-        self.chart.clear_trades()
-
-        self.calc_button.setEnabled(False)
-        self.optimize_button.setEnabled(False)
-        self.status.showMessage("正在计算投资策略...")
-
-        self.strategy_thread = QThread(self)
-        self.strategy_worker = StrategyWorker(
-            nav_data=self.current_history.dataframe,
-            start_date=start_date,
-            end_date=end_date,
-            buy_threshold=buy_threshold,
-            sell_threshold=sell_threshold,
-            total_capital=total_capital,
-            max_consecutive_buy=max_consecutive_buy,
-            max_consecutive_sell=max_consecutive_sell,
+    def get_fund(self) -> Fund:
+        main_ratio = self.main_ratio_spin.value() / 100.0
+        return Fund(
+            code=self._code,
+            name=self.name_edit.text() or self._name,
+            fund_type="自定义",
+            main_ratio=main_ratio,
+            swing_ratio=1.0 - main_ratio,
+            opportunity_line=self.opportunity_spin.value(),
+            middle_line=self.middle_spin.value(),
+            danger_line=self.danger_spin.value(),
+            per_share_amount=self.amount_spin.value(),
+            total_shares_count=int(self.shares_spin.value()),
         )
-        self.strategy_worker.moveToThread(self.strategy_thread)
-
-        self.strategy_thread.started.connect(self.strategy_worker.run)
-        self.strategy_worker.finished.connect(self._on_strategy_success)
-        self.strategy_worker.failed.connect(self._on_strategy_failed)
-        self.strategy_worker.finished.connect(self._cleanup_strategy_thread)
-        self.strategy_worker.failed.connect(self._cleanup_strategy_thread)
-        self.strategy_thread.start()
-
-    def _on_strategy_success(self, result: StrategyResult) -> None:
-        """策略计算成功回调"""
-        self.current_strategy_result = result
-
-        # 在图表上标记买卖点
-        self.chart.draw_trades(result)
-
-        # 显示结果
-        result_text = format_strategy_result(result)
-        self.result_text.setPlainText(result_text)
-
-        self.status.showMessage(
-            f"计算完成：收益率 {result.total_return_rate*100:+.2f}%，"
-            f"买入{result.buy_count}次，卖出{result.sell_count}次"
-        )
-
-    def _on_strategy_failed(self, message: str) -> None:
-        """策略计算失败回调"""
-        self.status.showMessage("计算失败")
-        QMessageBox.warning(self, "计算失败", message)
-        self.result_text.setPlainText(f"计算失败: {message}")
-
-    def _cleanup_strategy_thread(self) -> None:
-        """清理策略线程"""
-        self.calc_button.setEnabled(True)
-        self.optimize_button.setEnabled(True)
-        if self.strategy_thread is not None:
-            self.strategy_thread.quit()
-            self.strategy_thread.wait(1000)
-            self.strategy_thread.deleteLater()
-            self.strategy_thread = None
-        if self.strategy_worker is not None:
-            self.strategy_worker.deleteLater()
-            self.strategy_worker = None
-
-    # ==================== 优化功能 ====================
-
-    def optimize_parameters(self) -> None:
-        """自动优化买卖参数"""
-        if self.current_history is None:
-            QMessageBox.warning(self, "提示", "请先查询基金净值数据")
-            return
-
-        if self.optimizer_thread is not None and self.optimizer_thread.isRunning():
-            return
-
-        # 获取参数
-        start_date = self.start_date_edit.date().toPyDate()
-        end_date = self.end_date_edit.date().toPyDate()
-        total_capital = self.total_capital_spin.value()
-        max_consecutive_buy = int(self.max_buy_spin.value())
-        max_consecutive_sell = int(self.max_sell_spin.value())
-
-        # 验证日期
-        if start_date >= end_date:
-            QMessageBox.warning(self, "参数错误", "建仓日期必须早于清仓日期")
-            return
-
-        # 重置图表，清除之前的买卖点标记
-        self.chart.clear_trades()
-
-        self.calc_button.setEnabled(False)
-        self.optimize_button.setEnabled(False)
-        self.status.showMessage("正在优化参数，请稍候...")
-        self.progress_bar.setVisible(True)
-        self.progress_bar.setRange(0, 0)  # 不确定进度
-
-        self.optimizer_thread = QThread(self)
-        # 使用快速优化模式
-        self.optimizer_worker = OptimizerWorker(
-            nav_data=self.current_history.dataframe,
-            start_date=start_date,
-            end_date=end_date,
-            quick_mode=True,
-            total_capital=total_capital,
-            max_consecutive_buy=max_consecutive_buy,
-            max_consecutive_sell=max_consecutive_sell,
-        )
-        self.optimizer_worker.moveToThread(self.optimizer_thread)
-
-        self.optimizer_thread.started.connect(self.optimizer_worker.run)
-        self.optimizer_worker.finished.connect(self._on_optimize_success)
-        self.optimizer_worker.failed.connect(self._on_optimize_failed)
-        self.optimizer_worker.finished.connect(self._cleanup_optimizer_thread)
-        self.optimizer_worker.failed.connect(self._cleanup_optimizer_thread)
-        self.optimizer_thread.start()
-
-    def _on_optimize_success(self, result: OptimizationResult) -> None:
-        """优化成功回调"""
-        # 更新参数输入框
-        self.buy_threshold_spin.setValue(result.optimal_buy_threshold * 100)
-        self.sell_threshold_spin.setValue(result.optimal_sell_threshold * 100)
-
-        # 保存优化结果
-        self.current_strategy_result = result.optimal_result
-
-        # 在图表上标记买卖点
-        self.chart.draw_trades(result.optimal_result)
-
-        # 显示结果
-        result_text = format_optimization_result(result)
-        self.result_text.setPlainText(result_text)
-
-        self.status.showMessage(
-            f"优化完成：最优买入{result.optimal_buy_threshold*100:.1f}%，"
-            f"卖出{result.optimal_sell_threshold*100:.1f}%，"
-            f"收益率{result.max_return_rate*100:+.2f}%"
-        )
-
-    def _on_optimize_failed(self, message: str) -> None:
-        """优化失败回调"""
-        self.status.showMessage("优化失败")
-        QMessageBox.warning(self, "优化失败", message)
-        self.result_text.setPlainText(f"优化失败: {message}")
-
-    def _cleanup_optimizer_thread(self) -> None:
-        """清理优化器线程"""
-        self.calc_button.setEnabled(True)
-        self.optimize_button.setEnabled(True)
-        self.progress_bar.setVisible(False)
-        if self.optimizer_thread is not None:
-            self.optimizer_thread.quit()
-            self.optimizer_thread.wait(1000)
-            self.optimizer_thread.deleteLater()
-            self.optimizer_thread = None
-        if self.optimizer_worker is not None:
-            self.optimizer_worker.deleteLater()
-            self.optimizer_worker = None
-
-
-# 导入 pandas 用于日期计算
-import pandas as pd

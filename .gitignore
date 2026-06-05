@@ -1,4 +1,5 @@
 .venv/
+.conda_env/
 __pycache__/
 *.pyc
 *.pyo
@@ -6,3 +7,6 @@ __pycache__/
 .Python
 .vscode/
 .specstory/
+data/*.db
+data/*.db-shm
+data/*.db-wal
